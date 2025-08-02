@@ -1,61 +1,54 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
-from xlsxwriter.utility import xl_col_to_name
+from urllib.parse import quote as urlquote  # אופציונלי אם תרצה קישור וואטסאפ
 
-# ===================== הגדרות עמוד ועיצוב =====================
+# ---------- Helper: convert 0-based column index to Excel column name ----------
+def xl_col_to_name_local(col_idx: int) -> str:
+    col_idx += 1
+    name = ""
+    while col_idx > 0:
+        col_idx, rem = divmod(col_idx - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+# ---------- Page & light styling ----------
 st.set_page_config(page_title="FreshTrack Analytics", layout="centered")
-
 st.markdown("""
     <style>
     body { background: linear-gradient(to bottom right, #fef3c7, #d1fae5, #dbeafe); }
-    .title-text { font-size: 3rem; font-weight: bold;
+    .title-text { font-size: 2.2rem; font-weight: 700;
         background: linear-gradient(to right, #16a34a, #2563eb, #7c3aed);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    }
-    .subtitle-text { font-size: 1.2rem; color: #374151; margin-bottom: 1rem; }
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
     .upload-box { border: 4px dashed #6ee7b7; padding: 1rem; border-radius: 1rem; background-color: #ecfdf5; }
     </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<h1 style='text-align:center' class='title-text'>🚀 FreshTrack Analytics</h1>", unsafe_allow_html=True)
-st.markdown("<p class='subtitle-text' style='text-align:center'>השווה מחירון מול הוצאות במהירות 🥦🍓</p>", unsafe_allow_html=True)
+st.markdown("<h1 class='title-text' style='text-align:center'>🚀 FreshTrack Analytics</h1>", unsafe_allow_html=True)
 
-# ===================== קלטים כלליים =====================
-contact_name = st.text_input("שם הנמען בהודעה (אופציונלי)", value="")
-
+# ---------- Uploads ----------
 st.markdown("<div class='upload-box'>📥 העלה קובץ מחירון (Excel: מק\"ט, פריט, מחירון)</div>", unsafe_allow_html=True)
 pricing_file = st.file_uploader("מחירון", type=["xls", "xlsx"], key="pricing")
 
 st.markdown("<div class='upload-box'>📥 העלה קובץ הוצאות (Excel: תאריך, מק\"ט, פריט, כמות, מחיר לפני מע\"מ)</div>", unsafe_allow_html=True)
 expense_file = st.file_uploader("הוצאות", type=["xls", "xlsx"], key="expense")
 
-
-# ===================== עזר: פורמט סימן מספרי =====================
-def format_signed_number(x, decimals=2):
-    if pd.isna(x):
-        return ""
-    x = round(float(x), decimals)
-    sign = "+" if x > 0 else ("" if x == 0 else "")
-    return f"{sign}{x:.{decimals}f}"
-
-
-# ===================== לוגיקת השוואה =====================
+# ---------- Core compare (adds only one extra column: 'שינוי בשקלים') ----------
 def compare_files(pricing_file, expense_file, month: int = 6):
-    # קריאת קבצים
     pricing_df = pd.read_excel(pricing_file)
     expenses_df = pd.read_excel(expense_file)
 
-    # מחירון: 3 עמודות (מקט, פריט, מחירון)
+    # מחירון: בדיוק 3 עמודות בעברית
     pricing_df.columns = ['מקט', 'פריט', 'מחירון']
 
-    # הוצאות: דרושות 'תאריך', 'מקט' ועמודת מחיר בפועל
+    # דרישות בסיס להוצאות
     if 'תאריך' not in expenses_df.columns:
         raise ValueError("בקובץ הוצאות חסרה עמודת 'תאריך'")
 
     expenses_df['תאריך'] = pd.to_datetime(expenses_df['תאריך'], errors='coerce')
     expenses_df = expenses_df[expenses_df['תאריך'].dt.month == month].copy()
 
+    # מציאת עמודת מחיר בפועל
     price_col = None
     for cand in ["מחיר לפני מע\"מ", "מחיר לפני מע״מ", "מחיר_לפני_מע\"מ", "מחיר"]:
         if cand in expenses_df.columns:
@@ -67,9 +60,10 @@ def compare_files(pricing_file, expense_file, month: int = 6):
     if 'מקט' not in expenses_df.columns:
         raise ValueError("בקובץ הוצאות חסרה עמודת 'מקט'")
 
+    # מיזוג לפי מק\"ט
     merged = expenses_df.merge(pricing_df, on='מקט', how='left', suffixes=('_expenses', '_pricing'))
 
-    # סטטוס וסטיית מחיר (לא משנים את הלוגיקה העסקית)
+    # סטטוס (לוגיקה מקורית, ללא טולרנס)
     def status_row(row):
         p_list = row['מחירון']
         p_actual = row[price_col]
@@ -80,22 +74,19 @@ def compare_files(pricing_file, expense_file, month: int = 6):
         return '✅ תואם' if abs(p_list - p_actual) <= 0.00 else '❌ מחיר שונה'
 
     merged['סטטוס'] = merged.apply(status_row, axis=1)
-    merged['פער מחיר'] = merged[price_col] - merged['מחירון']           # מספרי
-    merged['סטיית מחיר'] = merged['פער מחיר'].apply(lambda v: format_signed_number(v, 2))  # מחרוזת עם סימן
 
-    prod_col = 'פריט_expenses' if 'פריט_expenses' in merged.columns else ('פריט' if 'פריט' in merged.columns else None)
+    # -------- העמודה היחידה הנוספת: שינוי בשקלים --------
+    merged['שינוי בשקלים'] = merged[price_col] - merged['מחירון']
 
-    preferred_cols = [c for c in [
-        'לקוח', 'תעודה', 'תאריך', 'אספקה',
-        'מקט', prod_col, 'כמות',
-        price_col, 'מחירון', 'פער מחיר', 'סטיית מחיר', 'סטטוס'
-    ] if c and c in merged.columns]
+    # שומרים את סדר העמודות המקורי; רק מבטיחים שהעמודה החדשה בסוף
+    cols = list(merged.columns)
+    if cols[-1] != 'שינוי בשקלים':
+        cols = [c for c in cols if c != 'שינוי בשקלים'] + ['שינוי בשקלים']
+    ordered = merged[cols]
 
-    ordered = merged[preferred_cols + [c for c in merged.columns if c not in preferred_cols]]
-
-    # יצוא אקסל מלא עם עיצוב מותנה לפי סטטוס
-    out_full = BytesIO()
-    with pd.ExcelWriter(out_full, engine='xlsxwriter') as writer:
+    # -------- יצוא ל-Excel עם עיצוב קל, AutoFilter על כל העמודות --------
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
         ordered.to_excel(writer, index=False, sheet_name='השוואה')
         wb = writer.book
         ws = writer.sheets['השוואה']
@@ -106,13 +97,13 @@ def compare_files(pricing_file, expense_file, month: int = 6):
             ws.write(0, col_idx, col_name, header_fmt)
             ws.set_column(col_idx, col_idx, 16)
 
-        # אוטו-פילטר והקפאת שורה
+        # Freeze header + AutoFilter לכל הטווח
         n_rows, n_cols = ordered.shape
-        ws.autofilter(f"A1:{xl_col_to_name(n_cols - 1)}{n_rows + 1}")
         ws.freeze_panes(1, 0)
+        ws.autofilter(f"A1:{xl_col_to_name_local(n_cols - 1)}{n_rows + 1}")
 
-        # עיצוב מותנה לכל השורה לפי סטטוס
-        data_range = f"A2:{xl_col_to_name(n_cols - 1)}{n_rows + 1}"
+        # עיצוב מותנה לכל השורה לפי סטטוס (לקריאות באקסל ווינדוס)
+        data_range = f"A2:{xl_col_to_name_local(n_cols - 1)}{n_rows + 1}"
         green = wb.add_format({'bg_color': '#DCFCE7'})
         red   = wb.add_format({'bg_color': '#FEE2E2'})
         yellow= wb.add_format({'bg_color': '#FEF9C3'})
@@ -120,12 +111,11 @@ def compare_files(pricing_file, expense_file, month: int = 6):
         ws.conditional_format(data_range, {'type': 'text', 'criteria': 'containing', 'value': '❌', 'format': red})
         ws.conditional_format(data_range, {'type': 'text', 'criteria': 'containing', 'value': '🟡', 'format': yellow})
 
-    out_full.seek(0)
-    return ordered, out_full, price_col, prod_col
+    out.seek(0)
+    return ordered, out, price_col
 
-
-# ===================== טמפלייט הודעה =====================
-def build_message(df, price_col, prod_col, contact_name: str):
+# ---------- Build WhatsApp message (only shown on button click) ----------
+def build_message(df: pd.DataFrame, price_col: str, contact_name: str):
     diffs = df[df['סטטוס'] == '❌ מחיר שונה'].copy()
     if diffs.empty:
         return "אין הבדלים בין המחירון למה ששילמת בפועל. ✅"
@@ -136,6 +126,9 @@ def build_message(df, price_col, prod_col, contact_name: str):
         "יש הבדל בין המחירון למה ששילמתי בפועל, הנה הרשימה:",
         "מוצר | מחירון | מה ששילמתי בפועל",
     ]
+
+    # נזהה עמודת פריט להצגה
+    prod_col = 'פריט_expenses' if 'פריט_expenses' in diffs.columns else ('פריט' if 'פריט' in diffs.columns else None)
 
     def as_price(x):
         if pd.isna(x):
@@ -150,134 +143,35 @@ def build_message(df, price_col, prod_col, contact_name: str):
 
     return "\n".join(lines)
 
-
-# ===================== זרימת האפליקציה =====================
+# ---------- UI flow ----------
 if pricing_file and expense_file:
     if st.button("🔍 השווה עכשיו"):
         try:
-            result_df, excel_full, actual_col, product_col = compare_files(pricing_file, expense_file, month=6)
-
-            # -------- סינון מהיר (על פי דרישתך) --------
-            st.subheader("🔎 סינון מהיר")
-            df_filtered = result_df.copy()
-
-            # מזהי עמודות
-            serial_candidates = ['מקט', 'מק״ט', "מק'ט"]
-            serial_col = next((c for c in serial_candidates if c in df_filtered.columns), None)
-            prod_display_col = product_col if (product_col and product_col in df_filtered.columns) else ('פריט' if 'פריט' in df_filtered.columns else None)
-
-            col1, col2, col3 = st.columns(3)
-            col4, col5, col6 = st.columns(3)
-
-            # לקוח
-            if 'לקוח' in df_filtered.columns:
-                clients = sorted(df_filtered['לקוח'].dropna().astype(str).unique().tolist())
-                chosen_clients = col1.multiselect("לקוח", options=clients, default=[])
-                if chosen_clients:
-                    df_filtered = df_filtered[df_filtered['לקוח'].astype(str).isin(chosen_clients)]
-
-            # תעודה
-            if 'תעודה' in df_filtered.columns:
-                docs = sorted(df_filtered['תעודה'].dropna().astype(str).unique().tolist())
-                chosen_docs = col2.multiselect("תעודה", options=docs, default=[])
-                if chosen_docs:
-                    df_filtered = df_filtered[df_filtered['תעודה'].astype(str).isin(chosen_docs)]
-
-            # סטטוס
-            if 'סטטוס' in df_filtered.columns:
-                statuses = ['✅ תואם', '❌ מחיר שונה', '🟡 לא נמצא במחירון', '⚠️ מחיר בפועל חסר']
-                existing_statuses = [s for s in statuses if s in df_filtered['סטטוס'].unique().tolist()]
-                chosen_status = col3.multiselect("סטטוס", options=existing_statuses, default=[])
-                if chosen_status:
-                    df_filtered = df_filtered[df_filtered['סטטוס'].isin(chosen_status)]
-
-            # תאריך (טווח)
-            if 'תאריך' in df_filtered.columns and pd.api.types.is_datetime64_any_dtype(df_filtered['תאריך']):
-                if not df_filtered['תאריך'].isna().all():
-                    min_date = df_filtered['תאריך'].min().date()
-                    max_date = df_filtered['תאריך'].max().date()
-                    date_range = col4.date_input("טווח תאריכים (תאריך)", value=(min_date, max_date))
-                    if isinstance(date_range, tuple) and len(date_range) == 2:
-                        start_date, end_date = date_range
-                        df_filtered = df_filtered[(df_filtered['תאריך'].dt.date >= start_date) & (df_filtered['תאריך'].dt.date <= end_date)]
-
-            # אספקה (טווח)
-            if 'אספקה' in df_filtered.columns:
-                if not pd.api.types.is_datetime64_any_dtype(df_filtered['אספקה']):
-                    df_filtered['אספקה'] = pd.to_datetime(df_filtered['אספקה'], errors='coerce')
-                if not df_filtered['אספקה'].isna().all():
-                    min_sup = df_filtered['אספקה'].min().date()
-                    max_sup = df_filtered['אספקה'].max().date()
-                    sup_range = col5.date_input("טווח תאריכים (אספקה)", value=(min_sup, max_sup))
-                    if isinstance(sup_range, tuple) and len(sup_range) == 2:
-                        start_sup, end_sup = sup_range
-                        df_filtered = df_filtered[(df_filtered['אספקה'].dt.date >= start_sup) & (df_filtered['אספקה'].dt.date <= end_sup)]
-
-            # מק״ט
-            if serial_col:
-                serials = sorted(df_filtered[serial_col].dropna().astype(str).unique().tolist())
-                chosen_serials = col6.multiselect("מק״ט", options=serials, default=[])
-                if chosen_serials:
-                    df_filtered = df_filtered[df_filtered[serial_col].astype(str).isin(chosen_serials)]
-
-            # פריט (חיפוש טקסט חופשי)
-            if prod_display_col:
-                query = st.text_input("חיפוש לפי פריט (מכיל)")
-                if query.strip():
-                    df_filtered = df_filtered[df_filtered[prod_display_col].astype(str).str.contains(query.strip(), case=False, na=False)]
-
-            # -------- הצגה + הורדה --------
-            st.success(f"נמצאו {len(df_filtered)} שורות לאחר הסינון.")
-            st.dataframe(df_filtered, use_container_width=True)
-
-            # הורדה - דוח מלא (ללא סינון)
+            result_df, result_excel, actual_price_col = compare_files(pricing_file, expense_file, month=6)
+            st.success("✔️ ההשוואה הושלמה.")
+            st.dataframe(result_df, use_container_width=True)
             st.download_button(
-                "📥 הורד את הדוח המלא (Excel)",
-                data=excel_full,
+                "📥 הורד את הדוח (Excel)",
+                data=result_excel,
                 file_name="comparison.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-            # הורדה - דוח לפי סינון (עם עיצוב)
-            def export_with_format(df):
-                out = BytesIO()
-                with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False, sheet_name='השוואה')
-                    wb = writer.book
-                    ws = writer.sheets['השוואה']
+            # ---- WhatsApp message: hidden by default, shown only when clicking a button ----
+            if 'show_msg' not in st.session_state:
+                st.session_state.show_msg = False
 
-                    header_fmt = wb.add_format({'bold': True, 'bg_color': '#F1F5F9', 'border': 1})
-                    for col_idx, col_name in enumerate(df.columns):
-                        ws.write(0, col_idx, col_name, header_fmt)
-                        ws.set_column(col_idx, col_idx, 16)
+            col_a, col_b = st.columns([1, 3])
+            if col_a.button("💬 הצג הודעה מוכנה לווטסאפ"):
+                st.session_state.show_msg = True
 
-                    n_rows, n_cols = df.shape
-                    ws.autofilter(f"A1:{xl_col_to_name(n_cols - 1)}{n_rows + 1}")
-                    ws.freeze_panes(1, 0)
-
-                    if 'סטטוס' in df.columns:
-                        data_range = f"A2:{xl_col_to_name(n_cols - 1)}{n_rows + 1}"
-                        green = wb.add_format({'bg_color': '#DCFCE7'})
-                        red   = wb.add_format({'bg_color': '#FEE2E2'})
-                        yellow= wb.add_format({'bg_color': '#FEF9C3'})
-                        ws.conditional_format(data_range, {'type': 'text', 'criteria': 'containing', 'value': '✅', 'format': green})
-                        ws.conditional_format(data_range, {'type': 'text', 'criteria': 'containing', 'value': '❌', 'format': red})
-                        ws.conditional_format(data_range, {'type': 'text', 'criteria': 'containing', 'value': '🟡', 'format': yellow})
-                out.seek(0)
-                return out
-
-            excel_filtered = export_with_format(df_filtered)
-            st.download_button(
-                "📥 הורד את הדוח (לפי הסינון)",
-                data=excel_filtered,
-                file_name="comparison_filtered.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-            # -------- טמפלייט הודעה --------
-            st.subheader("📝 טמפלייט הודעה (לפי הסינון)")
-            msg = build_message(df_filtered, actual_col, product_col, contact_name)
-            st.code(msg, language=None)
+            if st.session_state.show_msg:
+                contact_name = col_b.text_input("שם הנמען (לא חובה)", value="")
+                msg = build_message(result_df, actual_price_col, contact_name)
+                st.code(msg, language=None)
+                # אופציונלי: קישור וואטסאפ פתיחה עם הטקסט
+                # wa_link = "https://wa.me/?text=" + urlquote(msg)
+                # st.markdown(f"[פתח וואטסאפ עם ההודעה]({wa_link})")
 
         except Exception as e:
             st.error(f"❌ שגיאה בעת עיבוד הקבצים: {e}")
