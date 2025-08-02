@@ -1,251 +1,123 @@
-import streamlit as st
-import pandas as pd
+# ================== סינון מהיר ==================
+st.subheader("🔎 סינון מהיר")
+
+df_filtered = result_df.copy()
+
+# זיהוי שמות עמודות אפשריים
+serial_candidates = ['מקט', 'מק״ט', 'מק\'ט']
+serial_col = next((c for c in serial_candidates if c in df_filtered.columns), None)
+prod_display_col = product_col if product_col and product_col in df_filtered.columns else ('פריט' if 'פריט' in df_filtered.columns else None)
+
+col1, col2, col3 = st.columns(3)
+col4, col5, col6 = st.columns(3)
+
+# לקוח (רב-בחירה)
+if 'לקוח' in df_filtered.columns:
+    clients = sorted(df_filtered['לקוח'].dropna().astype(str).unique().tolist())
+    chosen_clients = col1.multiselect("לקוח", options=clients, default=[])
+    if chosen_clients:
+        df_filtered = df_filtered[df_filtered['לקוח'].astype(str).isin(chosen_clients)]
+
+# תעודה (רב-בחירה)
+if 'תעודה' in df_filtered.columns:
+    docs = sorted(df_filtered['תעודה'].dropna().astype(str).unique().tolist())
+    chosen_docs = col2.multiselect("תעודה", options=docs, default=[])
+    if chosen_docs:
+        df_filtered = df_filtered[df_filtered['תעודה'].astype(str).isin(chosen_docs)]
+
+# סטטוס (רב-בחירה)
+if 'סטטוס' in df_filtered.columns:
+    statuses = ['✅ תואם', '❌ מחיר שונה', '🟡 לא נמצא במחירון', '⚠️ מחיר בפועל חסר']
+    existing_statuses = [s for s in statuses if s in df_filtered['סטטוס'].unique().tolist()]
+    chosen_status = col3.multiselect("סטטוס", options=existing_statuses, default=[])
+    if chosen_status:
+        df_filtered = df_filtered[df_filtered['סטטוס'].isin(chosen_status)]
+
+# תאריך (טווח)
+if 'תאריך' in df_filtered.columns and pd.api.types.is_datetime64_any_dtype(df_filtered['תאריך']):
+    min_date = df_filtered['תאריך'].min().date() if not df_filtered['תאריך'].isna().all() else None
+    max_date = df_filtered['תאריך'].max().date() if not df_filtered['תאריך'].isna().all() else None
+    if min_date and max_date:
+        date_range = col4.date_input("טווח תאריכים (תאריך)", value=(min_date, max_date))
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range
+            df_filtered = df_filtered[(df_filtered['תאריך'].dt.date >= start_date) & (df_filtered['תאריך'].dt.date <= end_date)]
+
+# אספקה (טווח) — אם קיימת
+if 'אספקה' in df_filtered.columns:
+    # המרה לתאריך אם צריך
+    if not pd.api.types.is_datetime64_any_dtype(df_filtered['אספקה']):
+        df_filtered['אספקה'] = pd.to_datetime(df_filtered['אספקה'], errors='coerce')
+    if not df_filtered['אספקה'].isna().all():
+        min_sup = df_filtered['אספקה'].min().date()
+        max_sup = df_filtered['אספקה'].max().date()
+        sup_range = col5.date_input("טווח תאריכים (אספקה)", value=(min_sup, max_sup))
+        if isinstance(sup_range, tuple) and len(sup_range) == 2:
+            start_sup, end_sup = sup_range
+            df_filtered = df_filtered[(df_filtered['אספקה'].dt.date >= start_sup) & (df_filtered['אספקה'].dt.date <= end_sup)]
+
+# מק״ט (רב-בחירה) — אם קיים
+if serial_col:
+    serials = df_filtered[serial_col].dropna().astype(str).unique().tolist()
+    chosen_serials = col6.multiselect("מק״ט", options=sorted(serials), default=[])
+    if chosen_serials:
+        df_filtered = df_filtered[df_filtered[serial_col].astype(str).isin(chosen_serials)]
+
+# פריט — חיפוש טקסט (מכיל)
+if prod_display_col:
+    query = st.text_input("חיפוש לפי פריט (מכיל)")
+    if query.strip():
+        df_filtered = df_filtered[df_filtered[prod_display_col].astype(str).str.contains(query.strip(), case=False, na=False)]
+
+# ================== הצגה + הורדה לפי הסינון ==================
+st.success(f"נמצאו {len(df_filtered)} שורות לאחר הסינון.")
+st.dataframe(df_filtered, use_container_width=True)
+
+# ייצוא אקסל עם עיצוב (אותו סגנון כמו קודם)
 from io import BytesIO
+def export_with_format(df):
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='השוואה')
+        workbook = writer.book
+        ws = writer.sheets['השוואה']
 
+        # כותרות
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#F1F5F9', 'border': 1})
+        for col_idx, col_name in enumerate(df.columns):
+            ws.write(0, col_idx, col_name, header_fmt)
+            ws.set_column(col_idx, col_idx, 16)
 
-def load_excel(file: BytesIO) -> pd.DataFrame:
-    """Load an Excel file into a pandas DataFrame.
+        # עיצוב מותנה לפי סטטוס (אם קיים)
+        if 'סטטוס' in df.columns:
+            # נקבע טווח כלל השורות (צבע לכל השורה)
+            n_rows, n_cols = df.shape
+            last_col = n_cols - 1
+            # טווח נתונים (A2 עד עמודה אחרונה)
+            from xlsxwriter.utility import xl_col_to_name
+            data_range = f"A2:{xl_col_to_name(last_col)}{n_rows+1}"
 
-    Parameters
-    ----------
-    file : BytesIO
-        Uploaded file object from Streamlit file uploader.
+            green = workbook.add_format({'bg_color': '#DCFCE7'})
+            red   = workbook.add_format({'bg_color': '#FEE2E2'})
+            yellow= workbook.add_format({'bg_color': '#FEF9C3'})
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame containing the contents of the first sheet of the Excel file.
-    """
-    return pd.read_excel(file)
+            ws.conditional_format(data_range, {'type':'text', 'criteria':'containing', 'value':'✅', 'format':green})
+            ws.conditional_format(data_range, {'type':'text', 'criteria':'containing', 'value':'❌', 'format':red})
+            ws.conditional_format(data_range, {'type':'text', 'criteria':'containing', 'value':'🟡', 'format':yellow})
 
+    out.seek(0)
+    return out
 
-def filter_june_expenses(expenses: pd.DataFrame) -> pd.DataFrame:
-    """Filter the expense report DataFrame to include only rows from June.
+excel_filtered = export_with_format(df_filtered)
 
-    The function attempts to parse the 'תאריך' column to datetime. If parsing
-    fails for some rows, those rows are removed before filtering to June.
+st.download_button(
+    "📥 הורד את הדוח (לפי הסינון)",
+    data=excel_filtered,
+    file_name="comparison_filtered.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 
-    Parameters
-    ----------
-    expenses : pd.DataFrame
-        DataFrame containing the expense report.
-
-    Returns
-    -------
-    pd.DataFrame
-        Filtered DataFrame containing only expenses from June (month == 6).
-    """
-    df = expenses.copy()
-    if 'תאריך' not in df.columns:
-        # If no date column exists, return empty DataFrame
-        return pd.DataFrame()
-
-    # Convert date column to datetime, coercing errors to NaT
-    df['תאריך'] = pd.to_datetime(df['תאריך'], errors='coerce')
-    # Filter to June rows (month == 6)
-    df = df[df['תאריך'].dt.month == 6]
-    return df
-
-
-def _sanitize_column_name(name: str) -> str:
-    """Remove non-alphanumeric characters from a column name for robust matching.
-
-    Parameters
-    ----------
-    name : str
-        Original column name.
-
-    Returns
-    -------
-    str
-        Sanitized column name containing only Hebrew/Latin letters and digits.
-    """
-    import re
-
-    return re.sub(r"[^A-Za-z\u0590-\u05FF0-9]", "", str(name))
-
-
-def _find_column(df: pd.DataFrame, keywords: list[str]) -> str | None:
-    """Find a column in the DataFrame whose sanitized name contains any of the given keywords.
-
-    This helper allows matching of column names that might include punctuation or quotes,
-    which are removed by sanitization. For example, "מק\"ט" will sanitize to "מקט".
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame to search.
-    keywords : list[str]
-        List of substrings to look for in sanitized column names.
-
-    Returns
-    -------
-    str | None
-        The first matching column name, or None if no match is found.
-    """
-    sanitized_keywords = [_sanitize_column_name(k) for k in keywords]
-    for col in df.columns:
-        sanitized_col = _sanitize_column_name(col)
-        for key in sanitized_keywords:
-            if key in sanitized_col:
-                return col
-    return None
-
-
-def compare_prices(expenses: pd.DataFrame, price_list: pd.DataFrame) -> pd.DataFrame:
-    """Compare actual charged prices against expected prices from the price list.
-
-    This function attempts to be flexible with column names by matching columns
-    based on key substrings (e.g., matching 'מקט' even if written as "מק\"ט") and
-    detecting a price column containing the substring 'מחיר'. It performs a left
-    join from the expenses DataFrame to the price_list on the detected serial
-    number column and adds a status indicating price match, mismatch, or missing.
-
-    Parameters
-    ----------
-    expenses : pd.DataFrame
-        Filtered expense report DataFrame (June expenses).
-    price_list : pd.DataFrame
-        Price list DataFrame.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame containing the comparison results with an added 'סטאטוס' column.
-    """
-    # Detect serial number column in both DataFrames
-    serial_col_exp = _find_column(expenses, ["מקט"])
-    serial_col_price = _find_column(price_list, ["מקט"])
-
-    if serial_col_exp is None or serial_col_price is None:
-        raise KeyError("לא נמצאה עמודת מק""ט באחד הקבצים. ודאו שקיימת עמודת מק""ט.")
-
-    # Detect price column in price list: try to find 'מחירון' or any column containing 'מחיר'
-    price_col = None
-    # Prefer exact match to 'מחירון'
-    if 'מחירון' in price_list.columns:
-        price_col = 'מחירון'
-    else:
-        price_col = _find_column(price_list, ["מחירון", "מחיר"])
-
-    if price_col is None:
-        raise KeyError("לא נמצאה עמודת מחיר במחירון. ודאו שקיימת עמודת מחירון או עמודת מחיר.")
-
-    # Rename columns for consistent handling
-    price_list_renamed = price_list.rename(columns={price_col: 'מחיר מחירון', serial_col_price: 'מקט'})
-    expenses_renamed = expenses.rename(columns={serial_col_exp: 'מקט'})
-
-    # Perform left merge on 'מקט'
-    merged = pd.merge(
-        expenses_renamed,
-        price_list_renamed[['מקט', 'מחיר מחירון']],
-        on='מקט',
-        how='left'
-    )
-
-    # Determine status based on presence of expected price and price comparison
-    def determine_status(row):
-        expected = row['מחיר מחירון']
-        actual = row.get('מחיר לפני מע"מ')
-        # If there is no expected price (NaN), mark as missing from price list
-        if pd.isna(expected):
-            return '🟡 חסר במחירון'
-        # If the actual charged price equals the expected price
-        try:
-            # Compare numeric values (convert both to float)
-            if float(actual) == float(expected):
-                return '✅ תואם'
-            else:
-                return '❌ לא תואם'
-        except Exception:
-            return '❌ לא תואם'
-
-    merged['סטאטוס'] = merged.apply(determine_status, axis=1)
-    return merged
-
-
-def create_downloadable_excel(df: pd.DataFrame) -> bytes:
-    """Create an Excel file in memory containing the comparison results.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame containing the comparison results.
-
-    Returns
-    -------
-    bytes
-        Bytes representing the Excel file ready for download.
-    """
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Comparison')
-    # Seek to start of the BytesIO buffer
-    output.seek(0)
-    return output.getvalue()
-
-
-def main():
-    """Main function to run the Streamlit app."""
-    st.set_page_config(
-        page_title="השוואת מחירון והוצאות",
-        page_icon="📊",
-        layout="centered"
-    )
-
-    # App title and description (in Hebrew)
-    st.title("השוואת מחירון מול דוח הוצאות")
-    st.markdown(
-        """
-        ## ברוכים הבאים!
-        כאן תוכלו להשוות את דוח ההוצאות שלכם מול מחירון עדכני, ולזהות במהירות התאמות או
-        הבדלים במחיר. האפליקציה עובדת באופן הבא:
-        1. מעלים קובץ מחירון וקובץ הוצאות.
-        2. לוחצים על "השווה עכשיו" לקבלת דוח השוואה.
-        3. מורידים את קובץ התוצאה שמופיע לאחר ההשוואה.
-        """
-    )
-
-    # File uploaders
-    price_file = st.file_uploader("העלה קובץ מחירון", type=["xlsx", "xls"], key="price")
-    expense_file = st.file_uploader("העלה קובץ הוצאות", type=["xlsx", "xls"], key="expenses")
-
-    # Ensure both files are uploaded before proceeding
-    if price_file is not None and expense_file is not None:
-        if st.button("השווה עכשיו", key="compare_button"):
-            # Load files into DataFrames
-            try:
-                price_df = load_excel(price_file)
-                expenses_df = load_excel(expense_file)
-            except Exception as e:
-                st.error(f"אירעה שגיאה בקריאת הקבצים: {e}")
-                return
-
-            # Filter June expenses
-            june_expenses = filter_june_expenses(expenses_df)
-            if june_expenses.empty:
-                st.warning("לא נמצאו הוצאות לחודש יוני.")
-                return
-
-            # Perform comparison
-            comparison_df = compare_prices(june_expenses, price_df)
-
-            # Create downloadable Excel file
-            excel_bytes = create_downloadable_excel(comparison_df)
-
-            # Show download button with download icon
-            st.success("השוואה הושלמה בהצלחה!")
-            st.dataframe(comparison_df)  # Display comparison results
-            st.download_button(
-                label="📥 הורד קובץ השוואה",
-                data=excel_bytes,
-                file_name="comparison.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    else:
-        # Inform the user that both files are required
-        st.info("אנא העלו גם קובץ מחירון וגם קובץ הוצאות כדי להמשיך.")
-
-
-if __name__ == "__main__":
-    main()
+# ================== טמפלייט הודעה לפי הסינון ==================
+st.subheader("📝 טמפלייט הודעה (לפי הסינון)")
+msg = build_message(df_filtered, actual_col, prod_display_col, contact_name)
+st.code(msg, language=None)
