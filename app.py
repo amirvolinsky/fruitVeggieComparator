@@ -47,9 +47,18 @@ def _find_column(df: pd.DataFrame, keywords: list[str]) -> str | None:
 
 def compare_prices(expenses: pd.DataFrame, price_list: pd.DataFrame) -> pd.DataFrame:
     """
-    משווה מחיר בפועל מול מחיר מחירון.
-    לא משנה שמות/מבנה עמודות פרט לשינוי שם 'מחירון' ל'מחיר מחירון' וקונסולידציית 'מקט'.
-    מוסיף עמודה אחת בלבד: 'שוני במחיר' = מחיר בפועל - מחיר מחירון.
+    משווה מחיר בפועל מול מחיר מחירון תוך התחשבות במק"ט ובתאריך.
+
+    מהלך הפעולה:
+    1. מאתר את עמודות המק"ט והתאריך בשני הקבצים וממפה אותן לשמות אחידים.
+    2. מבצע מיזוג לפי מק"ט ותאריך כך שהשוואה תתבצע מול המחיר הרלוונטי לתאריך ההוצאה.
+    3. מאתר את עמודות המחיר בפועל במסמך ההוצאות (למשל "מחיר לפני מע"מ" ו"מחיר לאחר מע"מ").
+       במקרה שיש יותר מעמודה אחת, מנסה להתאים את המחיר במחירון לעמודה שתואמת את המחיר בפועל לאחר מע"מ (כיוון שבקבצי המחירון המחיר כולל מע"מ).
+       אם המחיר במחירון תואם לאחד העמודות — הסטטוס יסומן כ"✅ תואם" והפרש המחיר יחושב ביחס לאותה עמודה.
+       אם אין התאמה מלאה, נבחר את העמודה בעלת הפרש מינימלי ונחשב את הסטטוס כ"❌ לא תואם".
+    4. מחזיר DataFrame עם עמודת סטטוס ועמודת "שוני במחיר" (הפרש המחיר בפועל מהמחירון).
+
+    שים לב: אם המחיר במחירון חסר (NaN) עבור המקט/תאריך – הסטטוס יסומן כ"🟡 חסר במחירון" והפרש המחיר יהיה ריק.
     """
     # עמודת מק"ט בשני הקבצים
     serial_col_exp = _find_column(expenses, ["מקט"])
@@ -57,51 +66,121 @@ def compare_prices(expenses: pd.DataFrame, price_list: pd.DataFrame) -> pd.DataF
     if serial_col_exp is None or serial_col_price is None:
         raise KeyError("לא נמצאה עמודת מק\"ט באחד הקבצים. ודאו שקיימת עמודת מק\"ט.")
 
-    # עמודת מחיר במחירון (מעדיפים 'מחירון')
-    price_col_list = 'מחירון' if 'מחירון' in price_list.columns else _find_column(price_list, ["מחירון", "מחיר"])
+    # עמודת מחירון (עשויה לכלול רווח בסוף)
+    if 'מחירון ' in price_list.columns:
+        price_col_list = 'מחירון '
+    elif 'מחירון' in price_list.columns:
+        price_col_list = 'מחירון'
+    else:
+        price_col_list = _find_column(price_list, ["מחירון", "מחיר"])
     if price_col_list is None:
         raise KeyError("לא נמצאה עמודת מחיר במחירון. ודאו שקיימת עמודת מחירון או עמודת מחיר.")
 
-    # איחוד שמות לשימוש פנימי בלבד
-    price_list_renamed = price_list.rename(columns={price_col_list: 'מחיר מחירון', serial_col_price: 'מקט'})
-    expenses_renamed = expenses.rename(columns={serial_col_exp: 'מקט'})
+    # עמודות תאריך בשני הקבצים
+    date_col_price = _find_column(price_list, ["תאריך", "date"])
+    date_col_exp = _find_column(expenses, ["תאריך", "date"])
+    if date_col_price is None or date_col_exp is None:
+        raise KeyError("לא נמצאה עמודת תאריך באחד הקבצים.")
 
-    # מיזוג לפי מק"ט
+    # איחוד שמות לשימוש פנימי בלבד
+    price_list_renamed = price_list.rename(columns={
+        price_col_list: 'מחיר מחירון',
+        serial_col_price: 'מקט',
+        date_col_price: 'תאריך'
+    })
+    expenses_renamed = expenses.rename(columns={
+        serial_col_exp: 'מקט',
+        date_col_exp: 'תאריך'
+    })
+
+    # המרה לתאריכים (לאובייקט date בלבד כדי שהשוואה תהיה ללא זמן)
+    price_list_renamed['תאריך'] = pd.to_datetime(price_list_renamed['תאריך'], errors='coerce').dt.date
+    expenses_renamed['תאריך'] = pd.to_datetime(expenses_renamed['תאריך'], errors='coerce').dt.date
+
+    # מיזוג לפי מק"ט ותאריך
     merged = pd.merge(
         expenses_renamed,
-        price_list_renamed[['מקט', 'מחיר מחירון']],
-        on='מקט',
+        price_list_renamed[['מקט', 'תאריך', 'מחיר מחירון']],
+        on=['מקט', 'תאריך'],
         how='left'
     )
 
-    # סטטוס (ללא שינוי לוגיקה)
-    def determine_status(row):
+    # מציאת כל עמודות המחיר הרלוונטיות במסמך ההוצאות
+    # נבדוק גם שמות בעברית לפני/אחרי מע"מ וגם שמות מסוננים
+    def _find_price_columns(columns: list[str]) -> list[str]:
+        candidates = []
+        for candidate in [
+            'מחיר לפני מע"מ', 'מחיר לפני מע"מ', 'מחיר לפני מע\"מ',
+            'מחיר לאחר מע"מ', 'מחיר לאחר מע\"מ'
+        ]:
+            if candidate in columns:
+                candidates.append(candidate)
+        # הוספת עמודות מסוננות שעלולות להכיל את המילים הללו
+        for col in columns:
+            sanitized = _sanitize_column_name(col)
+            if 'מחירלפנימעם' in sanitized or 'מחירלאחרמעם' in sanitized:
+                if col not in candidates:
+                    candidates.append(col)
+        return candidates
+
+    price_columns = _find_price_columns(list(expenses_renamed.columns))
+    # אם לא מצאנו עמודות מחיר, נשתמש במשתנה ריק בשביל תנאי מאוחר
+    if not price_columns:
+        price_columns = []
+
+    # קביעת סטטוס והפרש מחיר בהתבסס על העמודות שנמצאו
+    def determine_status_and_diff(row):
         expected = row['מחיר מחירון']
-        actual = row.get('מחיר לפני מע"מ')
+        # אם אין מחיר במחירון, נציין כחסר
         if pd.isna(expected):
-            return '🟡 חסר במחירון'
-        try:
-            if float(actual) == float(expected):
-                return '✅ תואם'
-            else:
-                return '❌ לא תואם'
-        except Exception:
-            return '❌ לא תואם'
+            return '🟡 חסר במחירון', pd.NA
+        # אסוף את המחירים בפועל מהרשימה
+        actual_values = []
+        for col in price_columns:
+            # במידה והעמודה לא קיימת בשורה (למשל אחרי merge), נמשיך
+            if col in row.index:
+                actual_values.append(row[col])
+        # המרת המחירים למספרים
+        numeric_actuals = []
+        for val in actual_values:
+            try:
+                numeric_actuals.append(float(val))
+            except Exception:
+                numeric_actuals.append(float('nan'))
+        expected_num = float(expected)
+        # אם אחת מהעמודות תואמת בדיוק את המחירון, נגדיר כתואם עם הפרש 0
+        for act in numeric_actuals:
+            # התאמה תוך התעלמות מהפרש זעיר (בעיות חישוב עשרוני)
+            if pd.notna(act) and abs(act - expected_num) < 1e-6:
+                return '✅ תואם', act - expected_num
+        # אחרת נמצא את העמודה עם הפרש מינימלי, אם קיימת
+        if numeric_actuals:
+            # רשימת הפרשים בין מחירים בפועל למחירון; אם הערך לא מספרי ניקח אינסוף כדי לא לבחור בו
+            diffs = [act - expected_num if pd.notna(act) else float('inf') for act in numeric_actuals]
+            # מציאת הפרש מינימלי בערכים סופיים בלבד
+            import math
+            valid_diffs = [d for d in diffs if not math.isinf(d)]
+            if valid_diffs:
+                min_diff = min(valid_diffs, key=lambda x: abs(x))
+                return '❌ לא תואם', min_diff
+        # אם אין עמודות מחיר תקינות, נחזיר סטטוס לא תואם והפרש לא ידוע
+        return '❌ לא תואם', pd.NA
 
-    merged['סטאטוס'] = merged.apply(determine_status, axis=1)
+    # החלת הפונקציה על כל השורות
+    status_list = []
+    diff_list = []
+    for _, row in merged.iterrows():
+        status, diff = determine_status_and_diff(row)
+        status_list.append(status)
+        diff_list.append(diff)
+    merged['סטאטוס'] = status_list
+    merged['שוני במחיר'] = diff_list
 
-    # -------- עמודה יחידה: שוני במחיר (מספרי) --------
-    if 'מחיר לפני מע"מ' in merged.columns:
-        actual_num = pd.to_numeric(merged['מחיר לפני מע"מ'], errors='coerce')
-        list_num = pd.to_numeric(merged['מחיר מחירון'], errors='coerce')
-        merged['שוני במחיר'] = actual_num - list_num
-    else:
-        merged['שוני במחיר'] = pd.NA
-
-    # לא משנים סדר עמודות, רק מקפידים שהעמודה החדשה תהיה בסוף
+    # דואגים שהעמודה החדשה תהיה בסוף
     cols = list(merged.columns)
+    # אם סדר העמודות אינו מסתיים ב'שוני במחיר', נסדר אותו
     if cols[-1] != 'שוני במחיר':
-        cols = [c for c in cols if c != 'שוני במחיר'] + ['שוני במחיר']
+        cols = [c for c in cols if c not in ['סטאטוס', 'שוני במחיר']] + ['סטאטוס', 'שוני במחיר']
     merged = merged[cols]
 
     return merged
